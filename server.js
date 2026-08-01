@@ -51,6 +51,10 @@ function buildMcpServer(engine) {
 
 export function createApp(engine) {
   const app = express();
+  // Render terminates TLS at its edge; trust the proxy so req.protocol is https.
+  // Without this the x402 SDK advertises an http:// resource URL and the sandbox
+  // resource-URL check fails.
+  app.set('trust proxy', true);
   app.use(express.json({ limit: '256kb' }));
 
   const manifest = () => ({

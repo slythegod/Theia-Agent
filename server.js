@@ -8,6 +8,7 @@ import { config } from './config.js';
 import { bootEngine } from './engine.js';
 import { SKILLS, SKILLS_BY_NAME, skillManifest } from './skills/index.js';
 import { x402Gate, paymentInfo } from './payments/x402.js';
+import { buildOkxPaymentMiddleware, okxSdkConfigured } from './payments/okx-x402.js';
 import { scoreboard, computeLedger, anchorCommand } from './reputation/ledger.js';
 import { assessJob } from './a2a/deep-desk.js';
 
@@ -60,7 +61,7 @@ export function createApp(engine) {
       http: `${config.server.publicUrl.replace(/\/$/, '')}/skills/<name>`,
       mcp: `${config.server.publicUrl.replace(/\/$/, '')}/mcp`,
     },
-    payment: paymentInfo(),
+    payment: { ...paymentInfo(), sdk: okxSdkConfigured() ? '@okxweb3/x402-express' : null },
     skills: skillManifest(),
     engineStatus: engine?.status ?? null,
   });
@@ -92,19 +93,26 @@ export function createApp(engine) {
     }
   });
 
+  // Official OKX seller SDK gates the paid skills when creds + enforce are set;
+  // otherwise fall back to the legacy per-route gate (free/dev or declare).
+  const okxPay = buildOkxPaymentMiddleware(SKILLS);
+  if (okxPay) {
+    app.use(okxPay);
+    console.log('[asp] x402 gating via official OKX seller SDK');
+  }
+
   for (const skill of SKILLS) {
-    app.post(
-      `/skills/${skill.name}`,
-      x402Gate({ priceUsdt: skill.priceUsdt, description: `${skill.title}: ${skill.description}` }),
-      async (req, res) => {
-        try {
-          const result = await skill.run(req.body || {}, engine);
-          res.status(result.ok ? 200 : 400).json(result);
-        } catch (e) {
-          res.status(500).json({ ok: false, skill: skill.name, error: { code: 'internal', message: e.message } });
-        }
-      },
-    );
+    const handlers = [];
+    if (!okxPay) handlers.push(x402Gate({ priceUsdt: skill.priceUsdt, description: `${skill.title}: ${skill.description}` }));
+    handlers.push(async (req, res) => {
+      try {
+        const result = await skill.run(req.body || {}, engine);
+        res.status(result.ok ? 200 : 400).json(result);
+      } catch (e) {
+        res.status(500).json({ ok: false, skill: skill.name, error: { code: 'internal', message: e.message } });
+      }
+    });
+    app.post(`/skills/${skill.name}`, ...handlers);
   }
 
   app.post('/mcp', async (req, res) => {
@@ -145,6 +153,10 @@ export async function start() {
 
 const isMain = process.argv[1] && process.argv[1].endsWith('server.js');
 if (isMain) {
+  // The OKX seller SDK fires an unhandled rejection if a boot-time facilitator
+  // sync fails (transient 401/network). Log it instead of crashing the ASP; the
+  // engine and free routes stay up and the SDK retries on later requests.
+  process.on('unhandledRejection', (e) => console.error(`[asp] unhandledRejection: ${e?.message || e}`));
   start().catch((e) => { console.error(`[asp] fatal: ${e.stack || e.message}`); process.exit(1); });
 }
 
